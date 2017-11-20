@@ -13,15 +13,16 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 import numpy as np
 from scipy.sparse import coo_matrix
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, average_precision_score
 import matplotlib.pyplot as plt
 
 import sys
 import argparse
 import pickle
 import time
-from tqdm import tqdm
+from tqdm import tnrange, tqdm_notebook
 
+""" Arguments """
 parser = argparse.ArgumentParser()
 
 parser.add_argument('data_path', metavar='DATA_PATH', help="Path to the dataset")
@@ -162,27 +163,35 @@ def visit_collate_fn(batch):
 
 
 class RETAIN(nn.Module):
-	def __init__(self, dim_input, dim_emb=256, dropout_emb=0.5, dim_alpha=256, dim_beta=256, dropout_context=0.5,
-				 dim_output=2, l2=0.0001, batch_first=True):
+	def __init__(self, dim_input, dim_emb=128, dropout_input=0.8, dropout_emb=0.5, dim_alpha=128, dim_beta=128,
+				 dropout_context=0.5, dim_output=2, l2=0.0001, batch_first=True):
 		super(RETAIN, self).__init__()
 		self.batch_first = batch_first
 		self.embedding = nn.Sequential(
+			nn.Dropout(p=dropout_input),
 			nn.Linear(dim_input, dim_emb, bias=False),
 			nn.Dropout(p=dropout_emb)
 		)
-		init.xavier_normal(self.embedding[0].weight)
+		init.xavier_normal(self.embedding[1].weight)
+
 		self.rnn_alpha = nn.GRU(input_size=dim_emb, hidden_size=dim_alpha, num_layers=1, batch_first=self.batch_first)
-		self.w_alpha = nn.Parameter(data=torch.ones((dim_alpha, 1)))
-		init.xavier_normal(self.w_alpha.data)
-		self.b_alpha = nn.Parameter(data=torch.zeros((1, 1)))
+
+		self.alpha_fc = nn.Linear(in_features=dim_alpha, out_features=1)
+		init.xavier_normal(self.alpha_fc.weight)
+		self.alpha_fc.bias.data.zero_()
+
 		self.rnn_beta = nn.GRU(input_size=dim_emb, hidden_size=dim_beta, num_layers=1, batch_first=self.batch_first)
+
 		self.beta_fc = nn.Linear(in_features=dim_beta, out_features=dim_emb)
 		init.xavier_normal(self.beta_fc.weight, gain=nn.init.calculate_gain('tanh'))
+		self.beta_fc.bias.data.zero_()
+
 		self.output = nn.Sequential(
 			nn.Dropout(p=dropout_context),
 			nn.Linear(in_features=dim_emb, out_features=dim_output)
 		)
 		init.xavier_normal(self.output[1].weight)
+		self.output[1].bias.data.zero_()
 
 	def forward(self, x, lengths):
 		if self.batch_first:
@@ -204,14 +213,11 @@ class RETAIN(nn.Module):
 		mask = Variable(torch.FloatTensor(
 			[[1.0 if i < lengths[idx] else 0.0 for i in range(max_len)] for idx in range(batch_size)]).unsqueeze(2),
 						requires_grad=False)
-		if self.b_alpha.is_cuda:
+		if next(self.parameters()).is_cuda:  # returns a boolean
 			mask = mask.cuda()
 
 		# e => batch_size X max_len X 1
-		e = torch.baddbmm(self.b_alpha.unsqueeze(0).repeat(batch_size, max_len, 1),
-						  alpha_unpacked,
-						  self.w_alpha.unsqueeze(0).repeat(batch_size, 1, 1)
-						  )
+		e = self.alpha_fc(alpha_unpacked)
 
 		def masked_softmax(batch_tensor, mask):
 			exp = torch.exp(batch_tensor)
@@ -240,13 +246,13 @@ class RETAIN(nn.Module):
 		# without applying non-linearity
 		logit = self.output(context)
 
-		return logit
+		return logit, alpha, beta
 
 
 """ Epoch function """
 
 
-def epoch(loader, model, criterion, cuda, optimizer=None, train=False):
+def epoch(loader, model, criterion, optimizer=None, train=False):
 	if train and not optimizer:
 		raise AttributeError("Optimizer should be given for training")
 
@@ -261,21 +267,23 @@ def epoch(loader, model, criterion, cuda, optimizer=None, train=False):
 	labels = []
 	outputs = []
 
-	for bi, batch in enumerate(tqdm(loader, desc="{} batches".format(mode), leave=False)):
+	for bi, batch in enumerate(tqdm_notebook(loader, desc="{} batches".format(mode), leave=False)):
 		inputs, targets, lengths = batch
 
 		input_var = torch.autograd.Variable(inputs)
 		target_var = torch.autograd.Variable(targets)
-		if cuda:
+		if args.cuda:
 			input_var = input_var.cuda()
 			target_var = target_var.cuda()
 
-		output = model(input_var, lengths)
+		output, alpha, beta = model(input_var, lengths)
 		loss = criterion(output, target_var)
 		assert not np.isnan(loss.data[0]), 'Model diverged with loss = NaN'
 
-		outputs.append(output.data)
 		labels.append(targets)
+
+		# since the outputs are logit, not probabilities
+		outputs.append(F.softmax(output).data)
 
 		# record loss
 		losses.update(loss.data[0], inputs.size(0))
@@ -293,7 +301,7 @@ def epoch(loader, model, criterion, cuda, optimizer=None, train=False):
 
 
 def main(argv):
-
+	global args
 	args = parser.parse_args(argv)
 	if args.threads == -1:
 		args.threads = torch.multiprocessing.cpu_count() - 1 or 1
@@ -349,7 +357,13 @@ def main(argv):
 
 	# Create model
 	print('===> Building a Model')
-	model = RETAIN(dim_input=num_features)
+	model = RETAIN(dim_input=num_features,
+				   dim_emb=512,
+				   dropout_emb=0.5,
+				   dim_alpha=512,
+				   dim_beta=512,
+				   dropout_context=0.5,
+				   dim_output=2)
 
 	if cuda:
 		model = model.cuda()
@@ -364,71 +378,89 @@ def main(argv):
 	if args.cuda:
 		criterion = criterion.cuda()
 
-	optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+	# optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+	optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.95)
 
+	best_valid_epoch = 0
 	best_valid_loss = sys.float_info.max
 	best_valid_auc = 0.0
+	best_valid_aupr = 0.0
+
 	train_losses = []
 	valid_losses = []
 
 	if args.plot:
 		# initialise the graph and settings
-		fig = plt.figure()
+
+		fig = plt.figure(figsize=(12, 9))  # , facecolor='w', edgecolor='k')
 		ax = fig.add_subplot(111)
+		plt.ion()
+		fig.show()
 		fig.canvas.draw()
 
-	for ei in tqdm(range(args.epochs), desc="Epochs"):
+	for ei in tnrange(args.epochs, desc="Epochs"):
 		# Train
-		train_y_true, train_output, train_loss = epoch(train_loader, model, criterion, cuda, optimizer=optimizer, train=True)
+		train_y_true, train_y_pred, train_loss = epoch(train_loader, model, criterion=criterion, optimizer=optimizer,
+													   train=True)
 		train_losses.append(train_loss)
 
 		# Eval
-		valid_y_true, valid_output, valid_loss = epoch(valid_loader, model, criterion, cuda)
+		valid_y_true, valid_y_pred, valid_loss = epoch(valid_loader, model, criterion=criterion)
 		valid_losses.append(valid_loss)
 
-		print("Epoch {} - Loss train: {}, valid: {}".format(ei, train_loss, valid_loss))
+		# print("Epoch {} - Loss train: {}, valid: {}".format(ei, train_loss, valid_loss))
 
-		# since the outputs are logit, not probabilities
-		valid_y_pred = F.softmax(valid_output)
 		if args.cuda:
 			valid_y_true = valid_y_true.cpu()
-			valid_output = valid_output.cpu()
-		valid_auc = roc_auc_score(valid_y_true.numpy(), valid_output.numpy()[:, 1], average="weighted")
+			valid_y_pred = valid_y_pred.cpu()
+
+		valid_auc = roc_auc_score(valid_y_true.numpy(), valid_y_pred.numpy()[:, 1], average="weighted")
+		valid_aupr = average_precision_score(valid_y_true.numpy(), valid_y_pred.numpy()[:, 1], average="weighted")
 
 		is_best = valid_auc > best_valid_auc
 
 		if is_best:
+			best_valid_epoch = ei
 			best_valid_loss = valid_loss
 			best_valid_auc = valid_auc
+			best_valid_aupr = valid_aupr
 
-			print("\t New best validation AUC!")
-			print("\t Evaluation on the test set")
+			# print("\t New best validation AUC!")
+			# print('\t Evaluation on the test set')
 
 			# evaluate on the test set
-			test_y_true, test_output, test_loss = epoch(test_loader, model, criterion, cuda)
+			test_y_true, test_y_pred, test_loss = epoch(test_loader, model, criterion=criterion)
 
 			if args.cuda:
 				train_y_true = train_y_true.cpu()
-				train_output = train_output.cpu()
+				train_y_pred = train_y_pred.cpu()
 				test_y_true = test_y_true.cpu()
-				test_output = test_output.cpu()
+				test_y_pred = test_y_pred.cpu()
 
-			train_auc = roc_auc_score(train_y_true.numpy(), train_output.numpy()[:, 1], average="weighted")
-			test_auc = roc_auc_score(test_y_true.numpy(), test_output.numpy()[:, 1], average="weighted")
+			train_auc = roc_auc_score(train_y_true.numpy(), train_y_pred.numpy()[:, 1], average="weighted")
+			train_aupr = average_precision_score(train_y_true.numpy(), train_y_pred.numpy()[:, 1], average="weighted")
 
-			print("Train - Loss: {}, AUC: {}".format(train_loss, train_auc))
-			print("Valid - Loss: {}, AUC: {}".format(valid_loss, valid_auc))
-			print(" Test - Loss: {}, AUC: {}".format(valid_loss, test_auc))
-			print("")
+			test_auc = roc_auc_score(test_y_true.numpy(), test_y_pred.numpy()[:, 1], average="weighted")
+			test_aupr = average_precision_score(test_y_true.numpy(), test_y_pred.numpy()[:, 1], average="weighted")
+
+			# print("Train - Loss: {}, AUC: {}".format(train_loss, train_auc))
+			# print("Valid - Loss: {}, AUC: {}".format(valid_loss, valid_auc))
+			# print(" Test - Loss: {}, AUC: {}".format(valid_loss, test_auc))
 
 			with open(args.save + 'train_result.txt', 'w') as f:
 				f.write('Best Validation Epoch: {}\n'.format(ei))
+				f.write('Best Validation Loss: {}\n'.format(best_valid_loss))
+				f.write('Best Validation AUROC: {}\n'.format(best_valid_auc))
+				f.write('Best Validation AUPR: {}\n'.format(best_valid_aupr))
 				f.write('Train Loss: {}\n'.format(train_loss))
-				f.write('Train AUC: {}\n'.format(train_auc))
-				f.write('Validation Loss: {}\n'.format(valid_loss))
-				f.write('Validation AUC: {}\n'.format(valid_auc))
+				f.write('Train AUROC: {}\n'.format(train_auc))
+				f.write('Train AUPR: {}\n'.format(train_aupr))
 				f.write('Test Loss: {}\n'.format(test_loss))
-				f.write('Test AUC: {}\n'.format(test_auc))
+				f.write('Test AUROC: {}\n'.format(test_auc))
+				f.write('Test AUPR: {}\n'.format(test_aupr))
+
+			torch.save(model, args.save + 'best_model.pth')
+			torch.save(model.state_dict(), args.save + 'best_model_params.pth')
 
 		# plot
 		if args.plot:
@@ -438,8 +470,17 @@ def main(argv):
 			ax.set_xlabel('epoch')
 			ax.set_ylabel('Loss')
 			ax.legend(loc="best")
+			plt.tight_layout()
 			fig.canvas.draw()
-			fig.savefig('learning_curve.eps', format='eps')
+			time.sleep(0.1)
+
+	print('Best Validation Epoch: {}\n'.format(best_valid_epoch))
+	print('Best Validation Loss: {}\n'.format(best_valid_loss))
+	print('Best Validation AUROC: {}\n'.format(best_valid_auc))
+	print('Best Validation AUPR: {}\n'.format(best_valid_aupr))
+	print('Test Loss: {}\n'.format(test_loss))
+	print('Test AUROC: {}\n'.format(test_auc))
+	print('Test AUPR: {}\n'.format(test_aupr))
 
 
 if __name__ == "__main__":
